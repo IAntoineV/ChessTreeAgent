@@ -166,11 +166,12 @@ class BatchedChessTreeEnv:
 # ===== EXAMPLE =====
 
 if __name__ == "__main__":
+    STOCKFISH_PATH = ... # include your stockfish path here
     def board_sampler():
         while True:
             yield chess.Board()
 
-    env = BatchedChessTreeEnv(MockEncoder(), board_sampler(), max_steps=3, num_envs=2, stockfish_path="/home/antoine/Bureau/3A/ChessRL/stockfish/stockfish-ubuntu-x86-64-avx2")
+    env = BatchedChessTreeEnv(MockEncoder(), board_sampler(), max_steps=3, num_envs=2, stockfish_path=STOCKFISH_PATH)
     state = env.reset()
     print("Initial state:", state.shape)
     for t in range(3):
