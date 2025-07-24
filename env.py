@@ -1,119 +1,180 @@
 import torch
 import chess
+import chess.engine
 import numpy as np
 from copy import deepcopy
 from collections import defaultdict
-from .utils import board_encoding, policy_index, policy_inverse_map
+
+# ===== MOCKS =====
+
+TOTAL_MOVES = 10  # small for demo
+legal_moves = [
+    chess.Move.from_uci(m)
+    for m in ["e2e4","d2d4","g1f3","c2c4","f2f4","b1c3","e2e3","d2d3","g2g3","b2b3"]
+]
+policy_index = {i: m for i, m in enumerate(legal_moves)}
+policy_inverse_map = {m: i for i, m in policy_index.items()}
+
+def board_encoding(board):
+    return torch.randn(1, 4)
+
+class MockPolicy:
+    def __init__(self, logits):
+        self.probs = torch.softmax(logits, dim=0)
+
+class MockEncoder:
+    def __call__(self, x):
+        bs = x.size(0)
+        emb = torch.randn(bs, 4)
+        pol = [MockPolicy(torch.randn(TOTAL_MOVES)) for _ in range(bs)]
+        val = torch.tanh(torch.randn(bs))
+        return emb, pol, val
+
+# ===== TREE STRUCTURE =====
+
+class TreeNode:
+    def __init__(self, board, move=None, parent=None, value=None):
+        self.board = board
+        self.move = move
+        self.parent = parent
+        self.value = value
+        self.children = []
+        self.played_moves = set()
+        self.is_terminal = board.is_game_over()
+        self.root_player = parent.root_player if parent else board.turn
+
+    def add_child(self, move_id):
+        """Apply move by index and return new child node."""
+        mv = policy_index[move_id]
+        new_bd = deepcopy(self.board)
+        new_bd.push(mv)
+        self.played_moves.add(move_id)
+        child = TreeNode(new_bd, move=mv, parent=self)
+        self.children.append(child)
+        return child
+
+    def get_parent(self):
+        return self.parent
+
+    def get_children(self):
+        return self.children
+
+
+# ===== STOCKFISH EVALUATION =====
+
+def evaluate_with_stockfish(board: chess.Board,
+                            engine: chess.engine.SimpleEngine,
+                            root_player: bool,
+                            depth: int = 12) -> float:
+    """
+    Apply Stockfish to `board` to the given depth.
+    Returns a pawn-unit score from root_player's perspective.
+    """
+    info = engine.analyse(board, chess.engine.Limit(depth=depth))
+    score = info["score"].white().score(mate_score=100000) or 0
+    if root_player == chess.BLACK:
+        score = -score
+    return score / 100.0
+
+# ===== ENVIRONMENT =====
 
 class BatchedChessTreeEnv:
     """
-    Batched environment exploring a move-tree in parallel.
     Actions:
       0: reset to root
-      1: sample a move from policy head (normal sampling)
-      2: sample from policy head without reusing moves at each position
+      1: sample a move from policy (normal)
+      2: sample without repeating moves at this node
       3: backtrack one move
-    Episodes fixed-length, never truncated early.
     """
-    def __init__(self, encoder, board_sampler, max_steps=50, num_envs=4):
-        super().__init__()
-        self.num_envs       = num_envs
-        self.encoder        = encoder
-        self.board_sampler  = board_sampler
-        self.max_steps      = max_steps
-        self.current_step   = 0
+
+    def __init__(self, encoder, board_sampler, max_steps=10, num_envs=2, stockfish_path="stockfish"):
+        self.encoder = encoder
+        self.board_sampler = board_sampler
+        self.max_steps = max_steps
+        self.num_envs = num_envs
+        self.engine = chess.engine.SimpleEngine.popen_uci(stockfish_path)
 
     def reset(self):
-        # initialize root boards per env
-        self.roots = [next(self.board_sampler) for _ in range(self.num_envs)]
-        # board histories for backtrack logic
-        self.board_histories = [[deepcopy(r)] for r in self.roots]
-        # tried moves per fen per env for no-reuse sampling
-        self.tried_moves = [defaultdict(set) for _ in range(self.num_envs)]
-        self.current_step = 0
+        self.roots = [TreeNode(next(self.board_sampler)) for _ in range(self.num_envs)]
+        self.current = list(self.roots)
+        self.step_count = 0
 
-        # initial encoding
-        boards = [h[-1] for h in self.board_histories]
-        pre_state = torch.cat([board_encoding(b) for b in boards], dim=0)
-        emb, pol, val = self.encoder(pre_state)
-        self.state = emb.unsqueeze(1)    # shape: (num_envs,1,emb_dim)
-        self.policies = pol
-        self.values = val
+        boards = [n.board for n in self.current]
+        x = torch.cat([board_encoding(b) for b in boards], dim=0)
+        emb, pol, val = self.encoder(x)
+        self.state = emb.unsqueeze(1)
+        self.policies, self.values = pol, val
+
+        for i, n in enumerate(self.current):
+            n.value = self.values[i].item()
 
         return self.state
 
     def step(self, actions):
-        """Step through each env with batched actions."""
         for i, a in enumerate(actions.tolist()):
-            history = self.board_histories[i]
-            tried   = self.tried_moves[i]
-            board   = history[-1]
-            fen     = board.fen()
+            node = self.current[i]
 
             if a == 0:
-                # reset to root
-                history[:] = [deepcopy(self.roots[i])]
-                tried.clear()
+                # Action 0: reset to root
+                self.current[i] = self.roots[i]
 
             elif a == 1:
-                # normal policy sampling
-                policy = self.policies[i]
-                probs = policy.probs.cpu().numpy()
-                idx = np.random.choice(len(probs), p=probs)
-                move = policy_index[idx]
-                new_bd = deepcopy(board)
-                new_bd.push(move)
-                history.append(new_bd)
+                # Action 1: sample move normally
+                idx = torch.multinomial(self.policies[i].probs, 1).item()
+                self.current[i] = node.add_child(idx)
 
             elif a == 2:
-                # policy sampling without reuse
-                policy = self.policies[i]
-                idx = self._sample_from_policy(policy, tried[fen])
-                move = policy_index[idx]
-                new_bd = deepcopy(board)
-                new_bd.push(move)
-                history.append(new_bd)
+                # Action 2: sample without repeating moves at this node
+                probs = self.policies[i].probs.clone()
+                mask = torch.ones_like(probs, dtype=torch.bool)
+                for used in node.played_moves:
+                    mask[used] = False
+                masked = probs * mask
+                if masked.sum() <= 0:
+                    node.played_moves.clear()
+                    masked = probs
+                masked = masked / masked.sum()
+                idx = torch.multinomial(masked, 1).item()
+                self.current[i] = node.add_child(idx)
 
             elif a == 3:
-                # backtrack one
-                if len(history) > 1:
-                    history.pop()
-                tried[fen].clear()
+                # Action 3: backtrack one move
+                parent = node.get_parent()
+                if parent:
+                    self.current[i] = parent
 
-        self.current_step += 1
+        self.step_count += 1
 
-        # encode new positions
-        boards = [h[-1] for h in self.board_histories]
-        pre_state = torch.cat([board_encoding(b) for b in boards], dim=0)
-        emb, pol, val = self.encoder(pre_state)
+        boards = [n.board for n in self.current]
+        x = torch.cat([board_encoding(b) for b in boards], dim=0)
+        emb, pol, val = self.encoder(x)
         self.state = torch.cat([self.state, emb.unsqueeze(1)], dim=1)
-        self.policies = pol
-        self.values = val
+        self.policies, self.values = pol, val
 
+        for i, n in enumerate(self.current):
+            n.value = self.values[i].item()
 
-        # compute rewards and dones
-        rewards = self.values.squeeze().detach().cpu().numpy().astype(np.float32)
-        dones = np.array([self.current_step >= self.max_steps] * self.num_envs)
+        dones = np.array([self.step_count >= self.max_steps] * self.num_envs)
+        rewards = np.zeros(self.num_envs, dtype=np.float32)
+
         infos = [{} for _ in range(self.num_envs)]
-
         return self.state, rewards, dones, infos
 
-    def _sample_from_policy(self, policy, exclude_idxs):
-        """Sample according to policy distribution, excluding indexes in exclude_idxs."""
-        probs = policy.probs.cpu().numpy().copy()
-        mask = np.ones_like(probs)
-        mask[list(exclude_idxs)] = 0.0
-        probs *= mask
-        total = probs.sum()
-        if total <= 0:
-            # reset exclusion if all moves used
-            exclude_idxs.clear()
-            probs = policy.probs.cpu().numpy().copy()
-            total = probs.sum()
-        probs /= total
-        choice = np.random.choice(len(probs), p=probs)
-        exclude_idxs.add(choice)
-        return choice
-
     def close(self):
-        pass
+        self.engine.quit()
+
+# ===== EXAMPLE =====
+
+if __name__ == "__main__":
+    def board_sampler():
+        while True:
+            yield chess.Board()
+
+    env = BatchedChessTreeEnv(MockEncoder(), board_sampler(), max_steps=3, num_envs=2, stockfish_path="/home/antoine/Bureau/3A/ChessRL/stockfish/stockfish-ubuntu-x86-64-avx2")
+    state = env.reset()
+    print("Initial state:", state.shape)
+    for t in range(3):
+        actions = torch.tensor([1, 2])
+        state, rewards, dones, _ = env.step(actions)
+        print(f"Step {t+1}: rewards={rewards}, dones={dones}")
+    env.close()
